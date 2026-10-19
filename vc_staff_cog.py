@@ -50,9 +50,14 @@ LEADERBOARD_CHANNEL_ID = int(os.getenv("LEADERBOARD_CHANNEL_ID", "0") or 0)
 CHANNEL_NAME_HINT = "staff-leaderboard"
 
 PTS_PER_HOUR = 10
-BAR_LEN = 8
+BAR_LEN = 6
 REFRESH_SECONDS = 30
-EMBED_COLOR = 0x8A2BE2
+EMBED_COLOR = 0xB066FF   # soft purple
+
+LIVE_DOT = "🟣"   # in a public VC right now
+OFF_DOT = "⚫"    # not in VC
+BAR_ON = "🟪"
+BAR_OFF = "⬛"
 
 # Your custom emojis (the bot must share the server they live in)
 EMOJI_STAR = "<a:Elt_emoji_51:1552029199215100004>"
@@ -297,8 +302,8 @@ class VCStaff(commands.Cog):
 
         try:
             await member.send(
-                f"You were moved to AFK because you were farming in the public VC ({reason}). "
-                "The points from that time were removed."
+                f"Hey 💜 I moved you to AFK because you were farming in the public VC ({reason}). "
+                "I took the points from that time off. Be active with us and I'll count you again ✨"
             )
         except discord.HTTPException:
             pass  # DMs closed
@@ -308,7 +313,7 @@ class VCStaff(commands.Cog):
             if log:
                 try:
                     await log.send(
-                        f"{member.mention} was moved to AFK - {reason}.",
+                        f"💜 {member.mention} was moved to AFK - {reason}.",
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                 except discord.HTTPException:
@@ -345,6 +350,7 @@ class VCStaff(commands.Cog):
     def _build_embed(self, guild: discord.Guild) -> discord.Embed:
         week_keys = {today_key(i) for i in range(7)}
         day_key = today_key()
+        name = self.bot.user.display_name
 
         live_members = list(self._live_members(guild))
         live_ids = {m.id for _, m in live_members}
@@ -360,22 +366,22 @@ class VCStaff(commands.Cog):
 
         desc = (
             f"## {EMOJI_STAR} STAFF LEADERBOARD {EMOJI_STAR}\n"
-            "Earn points by staying active in the public voice channels.\n"
-            f"`{PTS_PER_HOUR} pts / hour in VC` · `staff & mods only`"
+            f"{EMOJI_KITTY} *{name} counts every minute you spend helping in voice* ✨\n"
+            f"-# `{PTS_PER_HOUR} pts / hour in VC` · staff & mods only"
         )
         if total_all <= 0:
-            desc += "\n\n*Tracking is live - hours appear as staff & mods join the public VCs.*"
+            desc += "\n\n*💜 Tracking is live - hours appear as soon as you join the public VCs.*"
 
         embed = discord.Embed(description=desc, color=EMBED_COLOR, timestamp=discord.utils.utcnow())
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         if BANNER_URL:
             embed.set_image(url=BANNER_URL)
 
-        # ---- podium (side by side, like the ELITE SYSTEM board)
+        # ---- podium
         medals = ("🥇", "🥈", "🥉")
         places = ("1st place", "2nd place", "3rd place")
         for medal, place, (m, total, _, _) in zip(medals, places, rows[:3]):
-            dot = "🟢 " if m.id in live_ids else ""
+            dot = f"{LIVE_DOT} " if m.id in live_ids else ""
             embed.add_field(
                 name=f"{medal} {place}",
                 value=f"{dot}{m.mention}\n**{pts(total):,}** pts\n`{fmt(total)}` in voice",
@@ -390,32 +396,32 @@ class VCStaff(commands.Cog):
                 filled = round(total / top * BAR_LEN)
                 if total > 0:
                     filled = max(1, filled)
-                bar = "■" * filled + "□" * (BAR_LEN - filled)
-                dot = "🟢" if m.id in live_ids else "⚫"
-                line = f"{dot} `#{i:>2}` {m.mention} `{bar}` **{pts(total):,}** pts"
-                if size + len(line) + 1 > 1000:
-                    lines.append("*...and more*")
+                bar = BAR_ON * filled + BAR_OFF * (BAR_LEN - filled)
+                dot = LIVE_DOT if m.id in live_ids else OFF_DOT
+                line = f"{dot} `#{i:>2}` {m.mention} {bar} **{pts(total):,}** pts"
+                if size + len(line) + 1 > 880:
+                    lines.append("*...and more* 💜")
                     break
                 lines.append(line)
                 size += len(line) + 1
-            embed.add_field(name=f"{EMOJI_ICON} Rankings", value="\n".join(lines), inline=False)
+            embed.add_field(name=f"{EMOJI_ICON} ʀᴀɴᴋɪɴɢs", value="\n".join(lines), inline=False)
 
-        # ---- top this week / top today (side by side)
+        # ---- top this week / top today
         weekly = sorted((r for r in rows if r[2] > 0), key=lambda r: r[2], reverse=True)[:3]
         if weekly:
             embed.add_field(
-                name=f"{EMOJI_KITTY} Top this week",
+                name=f"{EMOJI_KITTY} ᴛᴏᴘ ᴛʜɪs ᴡᴇᴇᴋ",
                 value="\n".join(
-                    f"`#{i}` {m.mention} **{pts(w):,}** pts" for i, (m, _, w, _) in enumerate(weekly, 1)
+                    f"{medals[i]} {m.mention} **{pts(w):,}** pts" for i, (m, _, w, _) in enumerate(weekly)
                 ),
                 inline=True,
             )
         daily = sorted((r for r in rows if r[3] > 0), key=lambda r: r[3], reverse=True)[:3]
         if daily:
             embed.add_field(
-                name="🔥 Top today",
+                name="✨ ᴛᴏᴘ ᴛᴏᴅᴀʏ",
                 value="\n".join(
-                    f"`#{i}` {m.mention} **{pts(d):,}** pts" for i, (m, _, _, d) in enumerate(daily, 1)
+                    f"{medals[i]} {m.mention} **{pts(d):,}** pts" for i, (m, _, _, d) in enumerate(daily)
                 ),
                 inline=True,
             )
@@ -425,21 +431,19 @@ class VCStaff(commands.Cog):
             by_ch: dict = {}
             for ch, m in live_members:
                 by_ch.setdefault(ch, []).append(m)
-            lines = [
-                f"🎙️ {ch.mention} - " + " ".join(m.mention for m in ms) for ch, ms in by_ch.items()
-            ]
-            embed.add_field(name="🟢 Live in voice", value="\n".join(lines)[:1024], inline=False)
+            lines = [f"🎙️ {ch.mention} - " + " ".join(m.mention for m in ms) for ch, ms in by_ch.items()]
+            embed.add_field(name=f"{LIVE_DOT} ʟɪᴠᴇ ɪɴ ᴠᴏɪᴄᴇ", value="\n".join(lines)[:1024], inline=False)
 
         # ---- team totals
         embed.add_field(
-            name=f"{EMOJI_STAR} Team totals",
+            name=f"{EMOJI_STAR} ᴛᴇᴀᴍ ᴛᴏᴛᴀʟs",
             value=(
                 f"`{len(rows)}` staff/mods · `{pts(total_all):,}` pts · `{fmt(total_all)}` in voice\n"
-                f"🟢 `{len(live_ids)}` in public VC right now"
+                f"{LIVE_DOT} `{len(live_ids)}` in public VC right now"
             ),
             inline=False,
         )
-        embed.set_footer(text=f"Live · updates every {REFRESH_SECONDS}s")
+        embed.set_footer(text=f"{name} · live · updates every {REFRESH_SECONDS}s 💜")
         return embed
 
     async def _update_panel(self) -> None:
