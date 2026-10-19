@@ -31,6 +31,7 @@ import io
 import json
 import os
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -96,6 +97,16 @@ TEMP_CATEGORY_HINT = "temp channels"    # otherwise: any category whose name con
 TEMP_STAY_MINUTES = 10    # staff/mod in a temp VC this long -> moved to a public VC
 TEMP_MUTED_MINUTES = 5    # staff/mod muted or deafened in a temp VC this long -> moved to AFK
 MOVE_TO_VC_ID = int(os.getenv("PUBLIC_MOVE_VC_ID", "0") or 0)  # optional: always move to this VC
+
+
+def _norm(text: str) -> str:
+    """lowercase + undo fancy unicode fonts (bold/script letters) so name checks still match."""
+    return unicodedata.normalize("NFKD", text or "").casefold()
+
+
+def _is_join_channel(channel) -> bool:
+    n = _norm(channel.name)
+    return "join" in n and "create" in n
 
 
 def fmt(seconds: float) -> str:
@@ -176,15 +187,20 @@ class VCStaff(commands.Cog):
 
     @staticmethod
     def is_temp_vc(channel) -> bool:
-        """Temp VC = a voice channel inside the Temp Channels category (not the join-to-create one)."""
+        """Temp VC = a voice channel in the Temp Channels category (the one holding JOIN TO CREATE)."""
         if channel is None or channel.id == AFK_CHANNEL_ID:
             return False
-        if "join to create" in channel.name.lower():
+        if VCStaff.is_public_vc(channel) or _is_join_channel(channel):
             return False
         if TEMP_CATEGORY_ID:
             return getattr(channel, "category_id", None) == TEMP_CATEGORY_ID
         cat = getattr(channel, "category", None)
-        return cat is not None and TEMP_CATEGORY_HINT in cat.name.lower()
+        if cat is None:
+            return False
+        if "temp" in _norm(cat.name):
+            return True
+        # fallback: the category that contains the "JOIN TO CREATE" channel
+        return any(_is_join_channel(c) for c in cat.voice_channels)
 
     def _live_members(self, guild: discord.Guild):
         """Yield (channel, member) for staff/mods currently in public VCs."""
@@ -208,6 +224,9 @@ class VCStaff(commands.Cog):
         for guild in self.bot.guilds:
             for _, m in self._live_members(guild):
                 self.active.setdefault(m.id, (guild.id, now))
+            n_temp = len([c for c in guild.voice_channels if self.is_temp_vc(c)])
+            print(f"[vc_staff] watching {n_temp} temp VC(s) in {guild.name} "
+                  f"(Move Members: {guild.me.guild_permissions.move_members})")
 
     def _flush(self) -> None:
         """Credit elapsed time to everyone still active and drop stale sessions."""
@@ -342,6 +361,11 @@ class VCStaff(commands.Cog):
         self._deduct(member.id, time.time() - since)
         self.farming.add(member.id)
         self._save(DATA_FILE, self.data)
+        await self._dm(
+            member,
+            f"Hey 💜 you were {reason} in a public VC, so I took those points off and I'm not counting "
+            "your time right now. Be active with us and I'll count you again ✨",
+        )
 
         if FARM_LOG_CHANNEL_ID:
             log = self.bot.get_channel(FARM_LOG_CHANNEL_ID)
@@ -372,7 +396,13 @@ class VCStaff(commands.Cog):
                 best, best_n = ch, n
         return best
 
-    async def _move_member(self, member: discord.Member, dest, reason: str) -> bool:
+    async def _dm(self, member: discord.Member, text: str) -> None:
+        try:
+            await member.send(text)
+        except discord.HTTPException:
+            pass  # DMs closed
+
+    async def _move_member(self, member: discord.Member, dest, reason: str, dm: str | None = None) -> bool:
         try:
             await member.move_to(dest, reason=reason)
         except discord.Forbidden:
@@ -386,6 +416,8 @@ class VCStaff(commands.Cog):
             return False
         self.temp_since.pop(member.id, None)
         self.temp_idle_since.pop(member.id, None)
+        if dm:
+            await self._dm(member, dm)
         if FARM_LOG_CHANNEL_ID:
             log = self.bot.get_channel(FARM_LOG_CHANNEL_ID)
             if log:
@@ -422,7 +454,11 @@ class VCStaff(commands.Cog):
                         if afk is None:
                             print(f"[vc_staff] AFK channel {AFK_CHANNEL_ID} not found.")
                         else:
-                            await self._move_member(m, afk, f"muted/deafened {TEMP_MUTED_MINUTES}+ min in a temp VC")
+                            await self._move_member(
+                                m, afk, f"muted/deafened {TEMP_MUTED_MINUTES}+ min in a temp VC",
+                                dm=(f"Hey 💜 you were muted/deafened in a temp VC for {TEMP_MUTED_MINUTES}+ minutes, "
+                                    "so I moved you to AFK. Join a public VC when you're ready to help ✨"),
+                            )
                         continue
 
                     # too long in a temp VC -> public VC
@@ -431,7 +467,11 @@ class VCStaff(commands.Cog):
                         if dest is None:
                             print("[vc_staff] no public VC to move staff to.")
                             continue
-                        await self._move_member(m, dest, f"{TEMP_STAY_MINUTES}+ min in a temp VC")
+                        await self._move_member(
+                            m, dest, f"{TEMP_STAY_MINUTES}+ min in a temp VC",
+                            dm=(f"Hey 💜 you were in a temp VC for {TEMP_STAY_MINUTES}+ minutes, "
+                                f"so I moved you to {dest.name}. Come help us in the public VCs ✨"),
+                        )
         for uid in list(self.temp_since):
             if uid not in seen:
                 self.temp_since.pop(uid, None)
@@ -676,6 +716,40 @@ class VCStaff(commands.Cog):
         self.panel = {"channel_override": ch.id, "channel_id": ch.id, "message_id": self._msg.id}
         self._save(PANEL_FILE, self.panel)
         await interaction.followup.send("Live leaderboard posted here. It updates by itself.", ephemeral=True)
+
+    # ---------- debug command ----------
+    @app_commands.command(name="tempcheck", description="Show what the bot sees in the temp VCs (debug)")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def tempcheck(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("You need the Manage Server permission to use this.", ephemeral=True)
+            return
+        guild, now = interaction.guild, time.time()
+        temp = [c for c in guild.voice_channels if self.is_temp_vc(c)]
+        afk = guild.get_channel(AFK_CHANNEL_ID)
+        dest = self._pick_public_vc(guild)
+        lines = [
+            f"Move Members permission: **{'yes' if guild.me.guild_permissions.move_members else 'NO - give it to the bot'}**",
+            f"Temp VCs found: **{len(temp)}**",
+            f"AFK channel: {afk.mention if afk else '**NOT FOUND**'}",
+            f"Public VC target: {dest.mention if dest else '**NONE FOUND**'}",
+            f"Rules: public VC after {TEMP_STAY_MINUTES} min, AFK after {TEMP_MUTED_MINUTES} min muted/deafened",
+        ]
+        if not temp:
+            cats = ", ".join(f"`{c.name}`" for c in guild.categories)
+            lines.append("No temp VCs detected. Set Railway variable `TEMP_CATEGORY_ID` to the ID of your temp "
+                         f"category. Categories I can see: {cats}")
+        for c in temp:
+            for m in c.members:
+                if not self.is_staff(m):
+                    continue
+                mins = (now - self.temp_since.get(m.id, now)) / 60
+                flag = " muted/deaf" if m.id in self.temp_idle_since else ""
+                ex = " (exempt)" if m.id in EXEMPT_USER_IDS else ""
+                lines.append(f"{c.mention}: {m.mention} - {mins:.0f} min{flag}{ex}")
+        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True,
+                                                allowed_mentions=discord.AllowedMentions.none())
 
 
 async def setup(bot: commands.Bot):
