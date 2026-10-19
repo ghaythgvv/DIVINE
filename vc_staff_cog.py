@@ -54,6 +54,14 @@ BAR_LEN = 8
 REFRESH_SECONDS = 30
 EMBED_COLOR = 0x8A2BE2
 
+# Your custom emojis (the bot must share the server they live in)
+EMOJI_STAR = "<a:Elt_emoji_51:1552029199215100004>"
+EMOJI_KITTY = "<a:Elt_Hellokitty:1544075596806623392>"
+EMOJI_ICON = "<:Elt_emoji_89:1552239138697121802>"
+
+# Optional big banner image at the bottom of the board (direct image/gif link).
+BANNER_URL = os.getenv("LEADERBOARD_BANNER_URL", "")
+
 
 def fmt(seconds: float) -> str:
     seconds = int(seconds)
@@ -212,68 +220,111 @@ class VCStaff(commands.Cog):
                     return ch
         return None
 
+    def _staff_members(self, guild: discord.Guild) -> dict[int, discord.Member]:
+        """Everyone holding the staff or moderator role (shown even with 0 time)."""
+        found: dict[int, discord.Member] = {}
+        for rid in STAFF_ROLE_IDS:
+            role = guild.get_role(rid)
+            if role:
+                for m in role.members:
+                    if not m.bot:
+                        found[m.id] = m
+        return found
+
     def _build_embed(self, guild: discord.Guild) -> discord.Embed:
         week_keys = {today_key(i) for i in range(7)}
+        day_key = today_key()
 
-        rows = []  # (member, total_secs, week_secs)
-        for uid, per_day in self.data.items():
-            m = guild.get_member(int(uid))
-            if m is None or not self.is_staff(m):
-                continue
+        live_members = list(self._live_members(guild))
+        live_ids = {m.id for _, m in live_members}
+
+        rows = []  # (member, total_secs, week_secs, today_secs)
+        for m in self._staff_members(guild).values():
+            per_day = self.data.get(str(m.id), {})
             total = sum(per_day.values())
-            if total <= 0:
-                continue
             week = sum(v for k, v in per_day.items() if k in week_keys)
-            rows.append((m, total, week))
-        rows.sort(key=lambda r: r[1], reverse=True)
+            rows.append((m, total, week, per_day.get(day_key, 0)))
+        rows.sort(key=lambda r: (-r[1], r[0].display_name.lower()))
+        total_all = sum(r[1] for r in rows)
 
         desc = (
+            f"## {EMOJI_STAR} STAFF LEADERBOARD {EMOJI_STAR}\n"
             "Earn points by staying active in the public voice channels.\n"
-            f"`{PTS_PER_HOUR} pts / hour in VC`"
+            f"`{PTS_PER_HOUR} pts / hour in VC` · `staff & mods only`"
         )
-        if not rows:
-            desc += "\n\nNo staff/mod VC time recorded yet."
+        if total_all <= 0:
+            desc += "\n\n*Tracking is live - hours appear as staff & mods join the public VCs.*"
 
-        embed = discord.Embed(
-            title="STAFF LEADERBOARD",
-            description=desc,
-            color=EMBED_COLOR,
-            timestamp=discord.utils.utcnow(),
-        )
+        embed = discord.Embed(description=desc, color=EMBED_COLOR, timestamp=discord.utils.utcnow())
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
+        if BANNER_URL:
+            embed.set_image(url=BANNER_URL)
 
-        # podium
-        for label, (m, total, _) in zip(("1st place", "2nd place", "3rd place"), rows[:3]):
+        # ---- podium (side by side, like the ELITE SYSTEM board)
+        medals = ("🥇", "🥈", "🥉")
+        places = ("1st place", "2nd place", "3rd place")
+        for medal, place, (m, total, _, _) in zip(medals, places, rows[:3]):
+            dot = "🟢 " if m.id in live_ids else ""
             embed.add_field(
-                name=label,
-                value=f"{m.mention}\n**{pts(total):,}** pts\n`{fmt(total)}` in voice",
+                name=f"{medal} {place}",
+                value=f"{dot}{m.mention}\n**{pts(total):,}** pts\n`{fmt(total)}` in voice",
                 inline=True,
             )
 
-        # rankings 4-15
+        # ---- rankings #4+
         if len(rows) > 3:
-            top = rows[0][1]
-            lines = []
-            for i, (m, total, _) in enumerate(rows[3:15], start=4):
-                filled = max(1, round(total / top * BAR_LEN))
+            top = rows[0][1] or 1
+            lines, size = [], 0
+            for i, (m, total, _, _) in enumerate(rows[3:], start=4):
+                filled = round(total / top * BAR_LEN)
+                if total > 0:
+                    filled = max(1, filled)
                 bar = "■" * filled + "□" * (BAR_LEN - filled)
-                lines.append(f"`#{i:>2}` {m.mention} `{bar}` **{pts(total):,}** pts")
-            embed.add_field(name="Rankings", value="\n".join(lines)[:1024], inline=False)
+                dot = "🟢" if m.id in live_ids else "⚫"
+                line = f"{dot} `#{i:>2}` {m.mention} `{bar}` **{pts(total):,}** pts"
+                if size + len(line) + 1 > 1000:
+                    lines.append("*...and more*")
+                    break
+                lines.append(line)
+                size += len(line) + 1
+            embed.add_field(name=f"{EMOJI_ICON} Rankings", value="\n".join(lines), inline=False)
 
-        # top this week
+        # ---- top this week / top today (side by side)
         weekly = sorted((r for r in rows if r[2] > 0), key=lambda r: r[2], reverse=True)[:3]
         if weekly:
-            lines = [f"`#{i}` {m.mention} **{pts(w):,}** pts" for i, (m, _, w) in enumerate(weekly, 1)]
-            embed.add_field(name="Top this week", value="\n".join(lines), inline=False)
+            embed.add_field(
+                name=f"{EMOJI_KITTY} Top this week",
+                value="\n".join(
+                    f"`#{i}` {m.mention} **{pts(w):,}** pts" for i, (m, _, w, _) in enumerate(weekly, 1)
+                ),
+                inline=True,
+            )
+        daily = sorted((r for r in rows if r[3] > 0), key=lambda r: r[3], reverse=True)[:3]
+        if daily:
+            embed.add_field(
+                name="🔥 Top today",
+                value="\n".join(
+                    f"`#{i}` {m.mention} **{pts(d):,}** pts" for i, (m, _, _, d) in enumerate(daily, 1)
+                ),
+                inline=True,
+            )
 
-        # team totals
-        total_all = sum(r[1] for r in rows)
-        live = sum(1 for _ in self._live_members(guild))
+        # ---- who is in voice right now
+        if live_members:
+            by_ch: dict = {}
+            for ch, m in live_members:
+                by_ch.setdefault(ch, []).append(m)
+            lines = [
+                f"🎙️ {ch.mention} - " + " ".join(m.mention for m in ms) for ch, ms in by_ch.items()
+            ]
+            embed.add_field(name="🟢 Live in voice", value="\n".join(lines)[:1024], inline=False)
+
+        # ---- team totals
         embed.add_field(
-            name="Team totals",
+            name=f"{EMOJI_STAR} Team totals",
             value=(
                 f"`{len(rows)}` staff/mods · `{pts(total_all):,}` pts · `{fmt(total_all)}` in voice\n"
-                f"`{live}` in public VC right now"
+                f"🟢 `{len(live_ids)}` in public VC right now"
             ),
             inline=False,
         )
