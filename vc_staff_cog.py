@@ -61,14 +61,11 @@ LEADERBOARD_CHANNEL_ID = int(os.getenv("LEADERBOARD_CHANNEL_ID", "0") or 0)
 CHANNEL_NAME_HINT = "staff-leaderboard"
 
 PTS_PER_HOUR = 10
-BAR_LEN = 6
 REFRESH_SECONDS = 30
 EMBED_COLOR = 0xB066FF   # soft purple
 
 LIVE_DOT = "🟣"   # in a public VC right now
-OFF_DOT = "⚫"    # not in VC
-BAR_ON = "🟪"
-BAR_OFF = "⬛"
+EMOJI_BUTTERFLY = "<a:156218darkpurplesparklybutterfly:1553826933890879518>"  # circle before each rank
 
 # Your custom emojis (the bot must share the server they live in)
 EMOJI_STAR = "<a:Elt_emoji_51:1552029199215100004>"
@@ -400,7 +397,8 @@ class VCStaff(commands.Cog):
         desc = (
             f"## {EMOJI_STAR} STAFF LEADERBOARD {EMOJI_STAR}\n"
             f"{EMOJI_KITTY} *{name} counts every minute you spend helping in voice* ✨\n"
-            f"-# `{PTS_PER_HOUR} pts / hour in VC` · staff & mods only"
+            f"-# `{PTS_PER_HOUR} pts / hour in VC` · staff & mods only\n"
+            "✦ ━━━━━━━━━━━━━━━━━━━━ ✦"
         )
         if total_all <= 0:
             desc += "\n\n*💜 Tracking is live - hours appear as soon as you join the public VCs.*"
@@ -423,17 +421,12 @@ class VCStaff(commands.Cog):
                 inline=True,
             )
 
-        # ---- rankings #4+
+        # ---- rankings #4+  (butterfly in the circle, no bars)
         if len(rows) > 3:
-            top = rows[0][1] or 1
             lines, size = [], 0
             for i, (m, total, _, _) in enumerate(rows[3:], start=4):
-                filled = round(total / top * BAR_LEN)
-                if total > 0:
-                    filled = max(1, filled)
-                bar = BAR_ON * filled + BAR_OFF * (BAR_LEN - filled)
-                dot = LIVE_DOT if m.id in live_ids else OFF_DOT
-                line = f"{dot} `#{i:>2}` {m.mention} {bar} **{pts(total):,}** pts"
+                live = f" {LIVE_DOT}" if m.id in live_ids else ""
+                line = f"{EMOJI_BUTTERFLY} `#{i:>2}` {m.mention} ・ **{pts(total):,}** pts{live}"
                 if size + len(line) + 1 > 880:
                     lines.append("*...and more* 💜")
                     break
