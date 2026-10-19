@@ -19,6 +19,16 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 async def setup_hook():
     await bot.load_extension("vc_staff_cog")
 
+    # Register the / slash commands. Set GUILD_ID in Railway for instant updates
+    # in your server; without it they sync globally (can take a while to appear).
+    guild_id = os.getenv("GUILD_ID")
+    if guild_id:
+        guild = discord.Object(id=int(guild_id))
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+    else:
+        await bot.tree.sync()
+
 
 @bot.event
 async def on_ready():
