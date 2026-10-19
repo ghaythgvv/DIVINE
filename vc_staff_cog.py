@@ -6,6 +6,9 @@ What it does:
   - Keeps a single embed in the staff-leaderboard channel and edits it every
     30 seconds (podium, rankings, top this week, team totals).
   - Uses the bot's own profile picture as the embed thumbnail.
+  - Temp channels: a staff/mod who sits in a temp VC (the "Temp Channels" category)
+    for 10 minutes is moved to a public VC; if they are muted/deafened there they
+    are moved to the AFK channel instead.
   - Anti-farming: if a staff/mod is deafened too long, or alone in a VC too long,
     the bot takes that idle time back and stops counting until they are active
     again. It does NOT move anyone and does NOT send any DM.
@@ -84,6 +87,15 @@ EXEMPT_USER_IDS: set[int] = set()   # user IDs that are never checked
 FARM_LOG_CHANNEL_ID = int(os.getenv("FARM_LOG_CHANNEL_ID", "0") or 0)  # optional log channel
 
 
+# ---- temp channels (the "JOIN TO CREATE" voice channels) ----
+TEMP_CHECK = os.getenv("TEMP_CHECK", "1") != "0"   # TEMP_CHECK=0 in Railway switches it off
+TEMP_CATEGORY_ID = int(os.getenv("TEMP_CATEGORY_ID", "0") or 0)  # optional: exact category ID
+TEMP_CATEGORY_HINT = "temp channels"    # otherwise: any category whose name contains this
+TEMP_STAY_MINUTES = 10    # staff/mod in a temp VC this long -> moved to a public VC
+TEMP_MUTED_MINUTES = 5    # staff/mod muted or deafened in a temp VC this long -> moved to AFK
+MOVE_TO_VC_ID = int(os.getenv("PUBLIC_MOVE_VC_ID", "0") or 0)  # optional: always move to this VC
+
+
 def fmt(seconds: float) -> str:
     seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
@@ -111,6 +123,9 @@ class VCStaff(commands.Cog):
         self.deaf_since: dict[int, float] = {}
         self.alone_since: dict[int, float] = {}
         self.farming: set[int] = set()   # members whose time is currently NOT being counted
+        self.temp_since: dict[int, float] = {}        # staff in a temp VC since
+        self.temp_idle_since: dict[int, float] = {}   # ...and muted/deafened since
+        self._warned_move = False
         self._podium_png: bytes | None = None
         self._podium_key = None        # what the cached image was drawn for
         self._podium_sent_key = None   # what the live message currently shows
@@ -156,6 +171,18 @@ class VCStaff(commands.Cog):
         if channel is None or channel.id == AFK_CHANNEL_ID:
             return False
         return channel.id in PUBLIC_VC_IDS or getattr(channel, "category_id", None) in PUBLIC_VC_IDS
+
+    @staticmethod
+    def is_temp_vc(channel) -> bool:
+        """Temp VC = a voice channel inside the Temp Channels category (not the join-to-create one)."""
+        if channel is None or channel.id == AFK_CHANNEL_ID:
+            return False
+        if "join to create" in channel.name.lower():
+            return False
+        if TEMP_CATEGORY_ID:
+            return getattr(channel, "category_id", None) == TEMP_CATEGORY_ID
+        cat = getattr(channel, "category", None)
+        return cat is not None and TEMP_CATEGORY_HINT in cat.name.lower()
 
     def _live_members(self, guild: discord.Guild):
         """Yield (channel, member) for staff/mods currently in public VCs."""
@@ -209,6 +236,11 @@ class VCStaff(commands.Cog):
                 await self._anti_farm()
             except Exception as e:
                 print(f"[vc_staff] anti-farm check failed: {e!r}")
+        if TEMP_CHECK:
+            try:
+                await self._temp_check()
+            except Exception as e:
+                print(f"[vc_staff] temp-vc check failed: {e!r}")
         self._save(DATA_FILE, self.data)
         try:
             await self._update_panel()
@@ -227,6 +259,9 @@ class VCStaff(commands.Cog):
     async def on_voice_state_update(self, member, before, after):
         if member.bot or not self.is_staff(member):
             return
+        if not self.is_temp_vc(after.channel):
+            self.temp_since.pop(member.id, None)
+            self.temp_idle_since.pop(member.id, None)
         if before.channel != after.channel:
             self.deaf_since.pop(member.id, None)
             self.alone_since.pop(member.id, None)
@@ -316,6 +351,89 @@ class VCStaff(commands.Cog):
                     )
                 except discord.HTTPException:
                     pass
+
+    # ---------- temp channels ----------
+    def _pick_public_vc(self, guild: discord.Guild):
+        """Where to send staff: PUBLIC_MOVE_VC_ID if set, else the public VC with the most regular members."""
+        if MOVE_TO_VC_ID:
+            ch = guild.get_channel(MOVE_TO_VC_ID)
+            if ch:
+                return ch
+        best, best_n = None, -1
+        for ch in guild.voice_channels:
+            if not self.is_public_vc(ch):
+                continue
+            if ch.user_limit and len(ch.members) >= ch.user_limit:
+                continue
+            n = len([m for m in ch.members if not m.bot and not self.is_staff(m)])
+            if n > best_n:
+                best, best_n = ch, n
+        return best
+
+    async def _move_member(self, member: discord.Member, dest, reason: str) -> bool:
+        try:
+            await member.move_to(dest, reason=reason)
+        except discord.Forbidden:
+            if not self._warned_move:
+                print("[vc_staff] can't move members - give the bot Move Members and "
+                      "View Channel/Connect on the target channels.")
+                self._warned_move = True
+            return False
+        except discord.HTTPException as e:
+            print(f"[vc_staff] move failed: {e!r}")
+            return False
+        self.temp_since.pop(member.id, None)
+        self.temp_idle_since.pop(member.id, None)
+        if FARM_LOG_CHANNEL_ID:
+            log = self.bot.get_channel(FARM_LOG_CHANNEL_ID)
+            if log:
+                try:
+                    await log.send(
+                        f"💜 {member.mention} moved to {dest.mention} - {reason}.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.HTTPException:
+                    pass
+        return True
+
+    async def _temp_check(self) -> None:
+        now = time.time()
+        seen: set[int] = set()
+        for guild in self.bot.guilds:
+            for ch in guild.voice_channels:
+                if not self.is_temp_vc(ch):
+                    continue
+                for m in list(ch.members):
+                    if not self.is_staff(m) or m.id in EXEMPT_USER_IDS:
+                        continue
+                    seen.add(m.id)
+                    self.temp_since.setdefault(m.id, now)
+                    vs = m.voice
+                    if vs and (vs.self_mute or vs.self_deaf or vs.mute or vs.deaf):
+                        self.temp_idle_since.setdefault(m.id, now)
+                    else:
+                        self.temp_idle_since.pop(m.id, None)
+
+                    # muted / deafened -> AFK
+                    if m.id in self.temp_idle_since and now - self.temp_idle_since[m.id] >= TEMP_MUTED_MINUTES * 60:
+                        afk = guild.get_channel(AFK_CHANNEL_ID)
+                        if afk is None:
+                            print(f"[vc_staff] AFK channel {AFK_CHANNEL_ID} not found.")
+                        else:
+                            await self._move_member(m, afk, f"muted/deafened {TEMP_MUTED_MINUTES}+ min in a temp VC")
+                        continue
+
+                    # too long in a temp VC -> public VC
+                    if now - self.temp_since[m.id] >= TEMP_STAY_MINUTES * 60:
+                        dest = self._pick_public_vc(guild)
+                        if dest is None:
+                            print("[vc_staff] no public VC to move staff to.")
+                            continue
+                        await self._move_member(m, dest, f"{TEMP_STAY_MINUTES}+ min in a temp VC")
+        for uid in list(self.temp_since):
+            if uid not in seen:
+                self.temp_since.pop(uid, None)
+                self.temp_idle_since.pop(uid, None)
 
     # ---------- the live leaderboard ----------
     def _find_channel(self):
