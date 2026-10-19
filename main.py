@@ -10,7 +10,7 @@ if not TOKEN:
 intents = discord.Intents.default()
 intents.members = True         # needed to read member roles
 intents.voice_states = True    # needed to track VC joins/leaves
-intents.message_content = True # needed for ! prefix commands
+intents.message_content = True # kept on so the bot connects exactly like before
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
@@ -19,23 +19,18 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 async def setup_hook():
     await bot.load_extension("vc_staff_cog")
 
-    # Register the / slash commands. Set GUILD_ID in Railway for instant updates
-    # in your server; without it they sync globally (can take a while to appear).
-    guild_id = os.getenv("GUILD_ID")
+    # The bot has no commands anymore: wipe the / commands registered earlier
+    # so they disappear from the server. (Safe to delete this block after one run.)
     try:
+        guild_id = os.getenv("GUILD_ID")
         if guild_id:
             guild = discord.Object(id=int(guild_id))
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            print(f"Synced {len(synced)} slash commands to guild {guild_id}: {[c.name for c in synced]}")
-        else:
-            synced = await bot.tree.sync()
-            print(f"Synced {len(synced)} slash commands globally: {[c.name for c in synced]}")
-    except discord.Forbidden:
-        print("SLASH SYNC FAILED (403 Missing Access): re-invite the bot with BOTH the "
-              "'bot' and 'applications.commands' scopes, and check GUILD_ID is the right server.")
+            bot.tree.clear_commands(guild=guild)
+            await bot.tree.sync(guild=guild)
+        await bot.tree.sync()
+        print("Old slash commands cleared.")
     except Exception as e:
-        print(f"SLASH SYNC FAILED: {e!r}")
+        print(f"Could not clear slash commands: {e!r}")
 
 
 @bot.event
