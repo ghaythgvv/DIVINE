@@ -21,7 +21,7 @@ SILVER = (222, 208, 255)
 ROSE = (255, 150, 205)
 LILAC = (190, 120, 255)
 
-USE_BUTTERFLY = True   # False = go back to the normal circle avatars
+USE_BUTTERFLY = False   # False = go back to the normal circle avatars
 EMOJI_ID = "1553826933890879518"
 EMOJI_URL = f"https://cdn.discordapp.com/emojis/{EMOJI_ID}.png?size=256&quality=lossless"
 
