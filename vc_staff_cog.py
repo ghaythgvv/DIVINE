@@ -6,6 +6,9 @@ What it does:
   - Keeps a single embed in the staff-leaderboard channel and edits it every
     30 seconds (podium, rankings, top this week, team totals).
   - Uses the bot's own profile picture as the embed thumbnail.
+  - Anti-farming: if a staff/mod is deafened too long, or alone in a VC too long,
+    the bot takes that idle time back and stops counting until they are active
+    again. It does NOT move anyone and does NOT send any DM.
 
 Use:
   - Run /leaderboard in the channel where you want the board (needs Manage Server).
@@ -67,12 +70,12 @@ EMOJI_ICON = "<:Elt_emoji_89:1552239138697121802>"
 # Optional big banner image at the bottom of the board (direct image/gif link).
 BANNER_URL = os.getenv("LEADERBOARD_BANNER_URL", "")
 
-# ---- anti-farming ----
-AFK_CHANNEL_ID = 1513904300013785241
+# ---- anti-farming (no moving, no DMs - it only stops counting idle time) ----
+AFK_CHANNEL_ID = 1513904300013785241   # still never counted as a public VC
 ANTI_FARM = os.getenv("ANTI_FARM", "1") != "0"   # set ANTI_FARM=0 in Railway to switch off
-DEAF_MINUTES = 5     # staff/mod deafened this long in a public VC = farming
-ALONE_MINUTES = 20   # staff/mod with no regular members (only staff/bots) this long = farming
-EXEMPT_USER_IDS: set[int] = set()   # user IDs that are never moved
+DEAF_MINUTES = 5     # staff/mod deafened this long in a public VC = not counted
+ALONE_MINUTES = 20   # staff/mod with no regular members (only staff/bots) this long = not counted
+EXEMPT_USER_IDS: set[int] = set()   # user IDs that are never checked
 FARM_LOG_CHANNEL_ID = int(os.getenv("FARM_LOG_CHANNEL_ID", "0") or 0)  # optional log channel
 
 
@@ -100,9 +103,9 @@ class VCStaff(commands.Cog):
         self.active: dict[int, tuple[int, float]] = {}
         self._msg: discord.Message | None = None
         self._warned = False
-        self._warned_move = False
         self.deaf_since: dict[int, float] = {}
         self.alone_since: dict[int, float] = {}
+        self.farming: set[int] = set()   # members whose time is currently NOT being counted
         self.ticker.start()
 
     # ---------- storage ----------
@@ -182,11 +185,13 @@ class VCStaff(commands.Cog):
                 and self.is_staff(member)
                 and self.is_public_vc(member.voice.channel)
             )
-            self._add(uid, now - last)
+            if uid not in self.farming:   # idle/farming time is not credited
+                self._add(uid, now - last)
             if still_in:
                 self.active[uid] = (guild_id, now)
             else:
                 del self.active[uid]
+                self.farming.discard(uid)
 
     @tasks.loop(seconds=REFRESH_SECONDS)
     async def ticker(self):
@@ -217,6 +222,7 @@ class VCStaff(commands.Cog):
         if before.channel != after.channel:
             self.deaf_since.pop(member.id, None)
             self.alone_since.pop(member.id, None)
+            self.farming.discard(member.id)
         elif before.self_deaf and not after.self_deaf:
             self.deaf_since.pop(member.id, None)
 
@@ -227,12 +233,13 @@ class VCStaff(commands.Cog):
             self.active[member.id] = (member.guild.id, time.time())
         elif was and not now_in:
             session = self.active.pop(member.id, None)
-            if session:
+            if session and member.id not in self.farming:
                 self._add(member.id, time.time() - session[1])
+            self.farming.discard(member.id)
 
-    # ---------- anti-farming ----------
+    # ---------- anti-farming (no move, no DM) ----------
     def _deduct(self, uid: int, seconds: float) -> None:
-        """Take farmed time back off the member's recent days."""
+        """Take idle time back off the member's recent days."""
         days = self.data.get(str(uid), {})
         left = seconds
         for i in range(3):
@@ -255,6 +262,7 @@ class VCStaff(commands.Cog):
             if member is None or member.voice is None or not self.is_public_vc(member.voice.channel):
                 self.deaf_since.pop(uid, None)
                 self.alone_since.pop(uid, None)
+                self.farming.discard(uid)
                 continue
 
             vs = member.voice
@@ -270,50 +278,32 @@ class VCStaff(commands.Cog):
             else:
                 self.alone_since.setdefault(uid, now)
 
+            reason, since = None, None
             if uid in self.deaf_since and now - self.deaf_since[uid] >= DEAF_MINUTES * 60:
-                await self._move_to_afk(member, f"deafened for {DEAF_MINUTES}+ minutes", self.deaf_since[uid])
+                reason, since = f"deafened for {DEAF_MINUTES}+ minutes", self.deaf_since[uid]
             elif uid in self.alone_since and now - self.alone_since[uid] >= ALONE_MINUTES * 60:
-                await self._move_to_afk(member, f"alone in the VC for {ALONE_MINUTES}+ minutes", self.alone_since[uid])
+                reason, since = f"alone in the VC for {ALONE_MINUTES}+ minutes", self.alone_since[uid]
 
-    async def _move_to_afk(self, member: discord.Member, reason: str, since: float) -> None:
-        afk = member.guild.get_channel(AFK_CHANNEL_ID)
-        if afk is None:
-            print(f"[vc_staff] AFK channel {AFK_CHANNEL_ID} not found.")
-            return
+            if reason:
+                if uid not in self.farming:
+                    await self._start_not_counting(member, reason, since)
+            else:
+                # no longer deafened / alone -> counting resumes
+                self.farming.discard(uid)
 
+    async def _start_not_counting(self, member: discord.Member, reason: str, since: float) -> None:
+        """Take back the idle time once, then stop counting until the member is active again."""
         self._flush()  # credit up to this second so the deduction below is exact
-        farmed = time.time() - since
-        try:
-            await member.move_to(afk, reason=f"Farming in public VC: {reason}")
-        except discord.Forbidden:
-            if not self._warned_move:
-                print("[vc_staff] can't move members - give the bot Move Members and "
-                      "Connect/View Channel on the AFK channel.")
-                self._warned_move = True
-            return
-        except discord.HTTPException as e:
-            print(f"[vc_staff] move failed: {e!r}")
-            return
-
-        self._deduct(member.id, farmed)
-        self.deaf_since.pop(member.id, None)
-        self.alone_since.pop(member.id, None)
+        self._deduct(member.id, time.time() - since)
+        self.farming.add(member.id)
         self._save(DATA_FILE, self.data)
-
-        try:
-            await member.send(
-                f"Hey 💜 I moved you to AFK because you were farming in the public VC ({reason}). "
-                "I took the points from that time off. Be active with us and I'll count you again ✨"
-            )
-        except discord.HTTPException:
-            pass  # DMs closed
 
         if FARM_LOG_CHANNEL_ID:
             log = self.bot.get_channel(FARM_LOG_CHANNEL_ID)
             if log:
                 try:
                     await log.send(
-                        f"💜 {member.mention} was moved to AFK - {reason}.",
+                        f"💜 {member.mention} isn't being counted - {reason}.",
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                 except discord.HTTPException:
