@@ -83,7 +83,9 @@ AFK_CHANNEL_ID = 1513904300013785241   # still never counted as a public VC
 ANTI_FARM = os.getenv("ANTI_FARM", "1") != "0"   # set ANTI_FARM=0 in Railway to switch off
 DEAF_MINUTES = 5     # staff/mod deafened this long in a public VC = not counted
 ALONE_MINUTES = 20   # staff/mod with no regular members (only staff/bots) this long = not counted
-EXEMPT_USER_IDS: set[int] = set()   # user IDs that are never checked
+EXEMPT_USER_IDS: set[int] = {
+    1552366484016205824,   # never moved / never checked
+}
 FARM_LOG_CHANNEL_ID = int(os.getenv("FARM_LOG_CHANNEL_ID", "0") or 0)  # optional log channel
 
 
