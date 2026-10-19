@@ -108,19 +108,6 @@ class VCStaff(commands.Cog):
                 if self.is_staff(m):
                     yield ch, m
 
-    def _has_access(self, ctx: commands.Context) -> bool:
-        return self.is_staff(ctx.author)
-
-    async def _guard(self, ctx: commands.Context) -> bool:
-        if self._has_access(ctx):
-            return True
-        await ctx.send(
-            "You need the staff or moderator role to use this.",
-            ephemeral=True,
-            delete_after=None if ctx.interaction else 10,
-        )
-        return False
-
     # ---------- lifecycle ----------
     async def cog_unload(self):
         self.ticker.cancel()
@@ -191,8 +178,6 @@ class VCStaff(commands.Cog):
     @commands.hybrid_command(name="vclive", description="Show staff and mods currently in public VCs")
     @commands.guild_only()
     async def vclive(self, ctx: commands.Context):
-        if not await self._guard(ctx):
-            return
         by_channel: dict[discord.abc.GuildChannel, list[discord.Member]] = {}
         for ch, m in self._live_members(ctx.guild):
             by_channel.setdefault(ch, []).append(m)
@@ -214,9 +199,10 @@ class VCStaff(commands.Cog):
     @commands.hybrid_command(name="vchours", description="Show VC hours for a staff member or mod")
     @commands.guild_only()
     async def vchours(self, ctx: commands.Context, member: discord.Member = None):
-        if not await self._guard(ctx):
-            return
         member = member or ctx.author
+        if not self.is_staff(member):
+            await ctx.send(f"{member.display_name} isn't staff or a moderator, so no VC hours are tracked for them.")
+            return
         self._flush()  # include the running session
         days = self.data.get(str(member.id), {})
 
@@ -234,8 +220,6 @@ class VCStaff(commands.Cog):
     @commands.hybrid_command(name="vctop", description="Leaderboard of staff and mod VC hours")
     @commands.guild_only()
     async def vctop(self, ctx: commands.Context, days: int = 7):
-        if not await self._guard(ctx):
-            return
         days = max(1, min(days, 365))
         self._flush()
         keys = {today_key(i) for i in range(days)}
