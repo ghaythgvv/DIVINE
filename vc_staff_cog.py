@@ -23,6 +23,8 @@ Setup:
     so hours (and the leaderboard message id) survive redeploys.
 """
 
+import asyncio
+import io
 import json
 import os
 import time
@@ -31,6 +33,12 @@ from datetime import datetime, timedelta, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+
+try:
+    import podium as podium_art   # podium.py + Poppins-Bold.ttf next to this file
+except Exception as _e:            # bot still works without the image
+    podium_art = None
+    print(f"[vc_staff] podium.py not loaded: {_e!r}")
 
 # Staff + Moderator roles - only these members are tracked.
 STAFF_ROLE_IDS = {
@@ -106,6 +114,9 @@ class VCStaff(commands.Cog):
         self.deaf_since: dict[int, float] = {}
         self.alone_since: dict[int, float] = {}
         self.farming: set[int] = set()   # members whose time is currently NOT being counted
+        self._podium_png: bytes | None = None
+        self._podium_key = None        # what the cached image was drawn for
+        self._podium_sent_key = None   # what the live message currently shows
         self.ticker.start()
 
     # ---------- storage ----------
@@ -337,7 +348,39 @@ class VCStaff(commands.Cog):
                         found[m.id] = m
         return found
 
-    def _build_embed(self, guild: discord.Guild) -> discord.Embed:
+    def _top3(self, guild: discord.Guild):
+        rows = []
+        for m in self._staff_members(guild).values():
+            total = sum(self.data.get(str(m.id), {}).values())
+            rows.append((m, total))
+        rows.sort(key=lambda r: (-r[1], r[0].display_name.lower()))
+        return [m for m, _ in rows[:3]]
+
+    async def _podium_image(self, guild: discord.Guild):
+        """PNG bytes of the podium banner (cached; redrawn only when the top 3 change)."""
+        if podium_art is None:
+            return None
+        try:
+            top = self._top3(guild)
+            if podium_art.USE_BUTTERFLY:
+                key = "static"
+            else:
+                key = tuple((m.id, m.display_avatar.key) for m in top)
+            if self._podium_png is None or key != self._podium_key:
+                avatars = []
+                for m in top:
+                    try:
+                        avatars.append(await m.display_avatar.replace(size=256, format="png").read())
+                    except Exception:
+                        avatars.append(None)
+                self._podium_png = await asyncio.to_thread(podium_art.render_podium, avatars)
+                self._podium_key = key
+            return self._podium_png
+        except Exception as e:
+            print(f"[vc_staff] podium render failed: {e!r}")
+            return None
+
+    def _build_embed(self, guild: discord.Guild, podium: bool = False) -> discord.Embed:
         week_keys = {today_key(i) for i in range(7)}
         day_key = today_key()
         name = self.bot.user.display_name
@@ -364,7 +407,9 @@ class VCStaff(commands.Cog):
 
         embed = discord.Embed(description=desc, color=EMBED_COLOR, timestamp=discord.utils.utcnow())
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
-        if BANNER_URL:
+        if podium:
+            embed.set_image(url="attachment://podium.png")
+        elif BANNER_URL:
             embed.set_image(url=BANNER_URL)
 
         # ---- podium
@@ -445,7 +490,8 @@ class VCStaff(commands.Cog):
                 self._warned = True
             return
 
-        embed = self._build_embed(ch.guild)
+        png = await self._podium_image(ch.guild)
+        embed = self._build_embed(ch.guild, podium=png is not None)
         no_ping = discord.AllowedMentions.none()
 
         # find the existing message (cached, else by saved id)
@@ -457,12 +503,20 @@ class VCStaff(commands.Cog):
 
         if self._msg is not None:
             try:
-                await self._msg.edit(embed=embed, allowed_mentions=no_ping)
+                kwargs = {"embed": embed, "allowed_mentions": no_ping}
+                if png is not None and (self._podium_sent_key != self._podium_key or not self._msg.attachments):
+                    kwargs["attachments"] = [discord.File(io.BytesIO(png), "podium.png")]
+                    self._podium_sent_key = self._podium_key
+                self._msg = await self._msg.edit(**kwargs)
                 return
             except discord.NotFound:
                 self._msg = None  # deleted - post a fresh one below
 
-        self._msg = await ch.send(embed=embed, allowed_mentions=no_ping)
+        kwargs = {"embed": embed, "allowed_mentions": no_ping}
+        if png is not None:
+            kwargs["file"] = discord.File(io.BytesIO(png), "podium.png")
+            self._podium_sent_key = self._podium_key
+        self._msg = await ch.send(**kwargs)
         self.panel.update({"channel_id": ch.id, "message_id": self._msg.id})
         self._save(PANEL_FILE, self.panel)
 
@@ -492,11 +546,14 @@ class VCStaff(commands.Cog):
 
         ch = interaction.channel
         self._flush()
+        png = await self._podium_image(ch.guild)
+        kwargs = {"embed": self._build_embed(ch.guild, podium=png is not None),
+                  "allowed_mentions": discord.AllowedMentions.none()}
+        if png is not None:
+            kwargs["file"] = discord.File(io.BytesIO(png), "podium.png")
+            self._podium_sent_key = self._podium_key
         try:
-            self._msg = await ch.send(
-                embed=self._build_embed(ch.guild),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            self._msg = await ch.send(**kwargs)
         except discord.Forbidden:
             await interaction.followup.send(
                 "I can't post here - give me View Channel, Send Messages and Embed Links in this channel.",
