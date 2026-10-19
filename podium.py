@@ -21,6 +21,9 @@ SILVER = (222, 208, 255)
 ROSE = (255, 150, 205)
 LILAC = (190, 120, 255)
 
+BG_FILE = "podium_bg.png"        # background picture (1200x440 works best)
+BG_TINT = (16, 6, 36, 40)       # dark purple overlay on top of it (last number = strength 0-255)
+
 USE_BUTTERFLY = False   # False = go back to the normal circle avatars
 EMOJI_ID = "1553826933890879518"
 EMOJI_URL = f"https://cdn.discordapp.com/emojis/{EMOJI_ID}.png?size=256&quality=lossless"
@@ -110,27 +113,42 @@ def _circle_avatar(data, d):
     return im
 
 
+def _background():
+    """podium_bg.png next to this file, cropped to fill the banner and darkened a bit
+    so the podium and text stay readable. Falls back to the purple gradient."""
+    try:
+        bg = Image.open(os.path.join(HERE, BG_FILE)).convert("RGB")
+        scale = max(W / bg.width, H / bg.height)
+        bg = bg.resize((round(bg.width * scale), round(bg.height * scale)), Image.LANCZOS)
+        left, top = (bg.width - W) // 2, (bg.height - H) // 2
+        bg = bg.crop((left, top, left + W, top + H)).convert("RGBA")
+        bg.alpha_composite(Image.new("RGBA", (W, H), BG_TINT))
+        return bg
+    except Exception:
+        img = Image.new("RGB", (W, H))
+        px = ImageDraw.Draw(img)
+        for y in range(H):
+            t = y / H
+            px.line([(0, y), (W, y)], fill=(int(10 + 36 * t), int(5 + 9 * t), int(24 + 74 * t)))
+        return img.convert("RGBA")
+
+
 def render_podium(avatars) -> bytes:
     """avatars: list of up to 3 PNG/JPEG byte strings (or None) for places 1, 2, 3."""
     avatars = list(avatars) + [None] * (3 - len(avatars))
     rnd = random.Random(7)
 
-    # --- background gradient
-    img = Image.new("RGB", (W, H))
-    px = ImageDraw.Draw(img)
-    for y in range(H):
-        t = y / H
-        px.line([(0, y), (W, y)], fill=(int(10 + 36 * t), int(5 + 9 * t), int(24 + 74 * t)))
-    img = img.convert("RGBA")
+    # --- background: podium_bg.png (cover-fit + dark overlay), else the purple gradient
+    img = _background()
 
     # --- big soft glow behind the winner
-    _glow(img, lambda d: d.ellipse([600 - 330, 40, 600 + 330, 420], fill=(176, 102, 255, 120)), 90)
-    _glow(img, lambda d: d.ellipse([600 - 200, 70, 600 + 200, 300], fill=(255, 120, 220, 70)), 70)
+    _glow(img, lambda d: d.ellipse([600 - 330, 40, 600 + 330, 420], fill=(176, 102, 255, 45)), 90)
+    _glow(img, lambda d: d.ellipse([600 - 200, 70, 600 + 200, 300], fill=(255, 120, 220, 25)), 70)
 
     # --- bokeh, sparkles, hearts
     bokeh = Image.new("RGBA", img.size, (0, 0, 0, 0))
     bd = ImageDraw.Draw(bokeh)
-    for _ in range(46):
+    for _ in range(20):
         r = rnd.randint(4, 16)
         x, y = rnd.randint(0, W), rnd.randint(0, H)
         bd.ellipse([x - r, y - r, x + r, y + r], fill=(200, 140, 255, rnd.randint(25, 70)))
