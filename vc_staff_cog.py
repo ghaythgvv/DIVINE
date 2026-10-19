@@ -1,7 +1,7 @@
 """
 vc_staff_cog.py - counts staff & mods in PUBLIC voice channels (live count + hours).
 
-Commands (prefix !):
+Commands (work as both ! and / slash commands):
   !vclive              -> who is in public VCs right now (staff + mods)
   !vchours [member]    -> hours for one staff/mod (today / 7d / 30d / total)
   !vctop [days]        -> leaderboard of staff/mod VC hours (default 7 days)
@@ -111,6 +111,16 @@ class VCStaff(commands.Cog):
     def _has_access(self, ctx: commands.Context) -> bool:
         return self.is_staff(ctx.author)
 
+    async def _guard(self, ctx: commands.Context) -> bool:
+        if self._has_access(ctx):
+            return True
+        await ctx.send(
+            "You need the staff or moderator role to use this.",
+            ephemeral=True,
+            delete_after=None if ctx.interaction else 10,
+        )
+        return False
+
     # ---------- lifecycle ----------
     async def cog_unload(self):
         self.ticker.cancel()
@@ -169,10 +179,19 @@ class VCStaff(commands.Cog):
                 self._add(member.id, time.time() - session[1])
 
     # ---------- commands ----------
-    @commands.command(name="vclive")
+    @commands.hybrid_command(name="vcping", description="Check that the bot is online")
+    @commands.guild_only()
+    async def vcping(self, ctx: commands.Context):
+        """Health check - works for everyone."""
+        await ctx.send(
+            f"Bot is online. Staff/mod role detected on you: **{self.is_staff(ctx.author)}**. "
+            f"Currently tracking **{len(self.active)}** staff/mods in public VC."
+        )
+
+    @commands.hybrid_command(name="vclive", description="Show staff and mods currently in public VCs")
     @commands.guild_only()
     async def vclive(self, ctx: commands.Context):
-        if not self._has_access(ctx):
+        if not await self._guard(ctx):
             return
         by_channel: dict[discord.abc.GuildChannel, list[discord.Member]] = {}
         for ch, m in self._live_members(ctx.guild):
@@ -192,10 +211,10 @@ class VCStaff(commands.Cog):
             )
         await ctx.send(embed=embed)
 
-    @commands.command(name="vchours")
+    @commands.hybrid_command(name="vchours", description="Show VC hours for a staff member or mod")
     @commands.guild_only()
     async def vchours(self, ctx: commands.Context, member: discord.Member = None):
-        if not self._has_access(ctx):
+        if not await self._guard(ctx):
             return
         member = member or ctx.author
         self._flush()  # include the running session
@@ -212,10 +231,10 @@ class VCStaff(commands.Cog):
         embed.add_field(name="Total", value=fmt(sum(days.values())))
         await ctx.send(embed=embed)
 
-    @commands.command(name="vctop")
+    @commands.hybrid_command(name="vctop", description="Leaderboard of staff and mod VC hours")
     @commands.guild_only()
     async def vctop(self, ctx: commands.Context, days: int = 7):
-        if not self._has_access(ctx):
+        if not await self._guard(ctx):
             return
         days = max(1, min(days, 365))
         self._flush()
