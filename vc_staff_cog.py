@@ -1,16 +1,19 @@
 """
-vc_staff_cog.py - counts staff & mods in PUBLIC voice channels (live count + hours).
+vc_staff_cog.py - ONE live staff leaderboard (no commands at all).
 
-Commands (work as both ! and / slash commands):
-  !vclive              -> who is in public VCs right now (staff + mods)
-  !vchours [member]    -> hours for one staff/mod (today / 7d / 30d / total)
-  !vctop [days]        -> leaderboard of staff/mod VC hours (default 7 days)
+What it does:
+  - Tracks how long STAFF + MODERATORS spend in the public voice channels.
+  - Keeps a single embed in the staff-leaderboard channel and edits it every
+    30 seconds (podium, rankings, top this week, team totals).
+  - Uses the bot's own profile picture as the embed thumbnail.
 
 Setup:
-  - Enable the Server Members + Voice States intents (code and Dev Portal).
-  - bot.load_extension("vc_staff_cog")  (or await bot.load_extension in setup_hook)
+  - Enable the Server Members intent (code + Developer Portal).
+  - The bot needs View Channel, Send Messages, Embed Links in the leaderboard channel.
+  - Optional Railway variable LEADERBOARD_CHANNEL_ID=<channel id>. If you skip it,
+    the bot finds the text channel whose name contains "staff-leaderboard".
   - On Railway, attach a Volume and set VC_HOURS_FILE=/data/vc_staff_hours.json
-    so hours survive redeploys.
+    so hours (and the leaderboard message id) survive redeploys.
 """
 
 import json
@@ -21,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 import discord
 from discord.ext import commands, tasks
 
-# Staff + Moderator roles - only these members are counted / can use commands.
+# Staff + Moderator roles - only these members are tracked.
 STAFF_ROLE_IDS = {
     1513904127837736992,  # staff
     1513904125086011402,  # moderator
@@ -37,14 +40,24 @@ PUBLIC_VC_IDS = {
 }
 
 DATA_FILE = os.getenv("VC_HOURS_FILE", "vc_staff_hours.json")
+PANEL_FILE = os.path.splitext(DATA_FILE)[0] + "_panel.json"
+LEADERBOARD_CHANNEL_ID = int(os.getenv("LEADERBOARD_CHANNEL_ID", "0") or 0)
+CHANNEL_NAME_HINT = "staff-leaderboard"
+
+PTS_PER_HOUR = 10
+BAR_LEN = 8
+REFRESH_SECONDS = 30
 EMBED_COLOR = 0x8A2BE2
 
 
 def fmt(seconds: float) -> str:
     seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
-    m = rem // 60
-    return f"{h}h {m:02d}m"
+    return f"{h}h {rem // 60:02d}m"
+
+
+def pts(seconds: float) -> int:
+    return round(seconds / 3600 * PTS_PER_HOUR)
 
 
 def today_key(offset_days: int = 0) -> str:
@@ -55,30 +68,35 @@ def today_key(offset_days: int = 0) -> str:
 class VCStaff(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.data: dict[str, dict[str, float]] = self._load()
+        self.data: dict[str, dict[str, float]] = self._load(DATA_FILE)
+        self.panel: dict = self._load(PANEL_FILE)
         # member_id -> (guild_id, last_tick_timestamp)
         self.active: dict[int, tuple[int, float]] = {}
+        self._msg: discord.Message | None = None
+        self._warned = False
         self.ticker.start()
 
     # ---------- storage ----------
-    def _load(self) -> dict:
+    @staticmethod
+    def _load(path: str) -> dict:
         try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
 
-    def _save(self) -> None:
-        tmp = DATA_FILE + ".tmp"
+    @staticmethod
+    def _save(path: str, obj: dict) -> None:
+        tmp = path + ".tmp"
         try:
-            folder = os.path.dirname(DATA_FILE)
+            folder = os.path.dirname(path)
             if folder:
                 os.makedirs(folder, exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.data, f)
-            os.replace(tmp, DATA_FILE)
+                json.dump(obj, f)
+            os.replace(tmp, path)
         except OSError as e:
-            print(f"[vc_staff] save failed: {e}")
+            print(f"[vc_staff] save failed ({path}): {e}")
 
     def _add(self, uid: int, seconds: float) -> None:
         if seconds <= 0:
@@ -112,7 +130,7 @@ class VCStaff(commands.Cog):
     async def cog_unload(self):
         self.ticker.cancel()
         self._flush()
-        self._save()
+        self._save(DATA_FILE, self.data)
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -141,10 +159,17 @@ class VCStaff(commands.Cog):
             else:
                 del self.active[uid]
 
-    @tasks.loop(seconds=60)
+    @tasks.loop(seconds=REFRESH_SECONDS)
     async def ticker(self):
         self._flush()
-        self._save()
+        self._save(DATA_FILE, self.data)
+        try:
+            await self._update_panel()
+        except discord.Forbidden:
+            print("[vc_staff] can't post/edit in the leaderboard channel - give the bot "
+                  "View Channel, Send Messages and Embed Links there.")
+        except Exception as e:
+            print(f"[vc_staff] panel update failed: {e!r}")
 
     @ticker.before_loop
     async def _before_ticker(self):
@@ -165,84 +190,115 @@ class VCStaff(commands.Cog):
             if session:
                 self._add(member.id, time.time() - session[1])
 
-    # ---------- commands ----------
-    @commands.hybrid_command(name="vcping", description="Check that the bot is online")
-    @commands.guild_only()
-    async def vcping(self, ctx: commands.Context):
-        """Health check - works for everyone."""
-        await ctx.send(
-            f"Bot is online. Staff/mod role detected on you: **{self.is_staff(ctx.author)}**. "
-            f"Currently tracking **{len(self.active)}** staff/mods in public VC."
-        )
+    # ---------- the live leaderboard ----------
+    def _find_channel(self):
+        if LEADERBOARD_CHANNEL_ID:
+            ch = self.bot.get_channel(LEADERBOARD_CHANNEL_ID)
+            if ch:
+                return ch
+        for guild in self.bot.guilds:
+            for ch in guild.text_channels:
+                if CHANNEL_NAME_HINT in ch.name.lower():
+                    return ch
+        return None
 
-    @commands.hybrid_command(name="vclive", description="Show staff and mods currently in public VCs")
-    @commands.guild_only()
-    async def vclive(self, ctx: commands.Context):
-        by_channel: dict[discord.abc.GuildChannel, list[discord.Member]] = {}
-        for ch, m in self._live_members(ctx.guild):
-            by_channel.setdefault(ch, []).append(m)
+    def _build_embed(self, guild: discord.Guild) -> discord.Embed:
+        week_keys = {today_key(i) for i in range(7)}
 
-        total = sum(len(v) for v in by_channel.values())
-        embed = discord.Embed(
-            title="Staff & Mods in Public VC",
-            description=f"**{total}** online in public voice right now",
-            color=EMBED_COLOR,
-        )
-        for ch, members in by_channel.items():
-            embed.add_field(
-                name=f"{ch.name} ({len(members)})",
-                value="\n".join(m.mention for m in members)[:1024],
-                inline=False,
-            )
-        await ctx.send(embed=embed)
-
-    @commands.hybrid_command(name="vchours", description="Show VC hours for a staff member or mod")
-    @commands.guild_only()
-    async def vchours(self, ctx: commands.Context, member: discord.Member = None):
-        member = member or ctx.author
-        if not self.is_staff(member):
-            await ctx.send(f"{member.display_name} isn't staff or a moderator, so no VC hours are tracked for them.")
-            return
-        self._flush()  # include the running session
-        days = self.data.get(str(member.id), {})
-
-        def span(n):
-            keys = {today_key(i) for i in range(n)}
-            return sum(v for k, v in days.items() if k in keys)
-
-        embed = discord.Embed(title=f"VC hours - {member.display_name}", color=EMBED_COLOR)
-        embed.add_field(name="Today", value=fmt(span(1)))
-        embed.add_field(name="7 days", value=fmt(span(7)))
-        embed.add_field(name="30 days", value=fmt(span(30)))
-        embed.add_field(name="Total", value=fmt(sum(days.values())))
-        await ctx.send(embed=embed)
-
-    @commands.hybrid_command(name="vctop", description="Leaderboard of staff and mod VC hours")
-    @commands.guild_only()
-    async def vctop(self, ctx: commands.Context, days: int = 7):
-        days = max(1, min(days, 365))
-        self._flush()
-        keys = {today_key(i) for i in range(days)}
-
-        rows = []
+        rows = []  # (member, total_secs, week_secs)
         for uid, per_day in self.data.items():
-            m = ctx.guild.get_member(int(uid))
+            m = guild.get_member(int(uid))
             if m is None or not self.is_staff(m):
                 continue
-            secs = sum(v for k, v in per_day.items() if k in keys)
-            if secs > 0:
-                rows.append((m, secs))
+            total = sum(per_day.values())
+            if total <= 0:
+                continue
+            week = sum(v for k, v in per_day.items() if k in week_keys)
+            rows.append((m, total, week))
         rows.sort(key=lambda r: r[1], reverse=True)
 
-        lines = [
-            f"`{i}.` {m.mention} - **{fmt(s)}**" for i, (m, s) in enumerate(rows[:10], 1)
-        ] or ["No staff/mod VC time recorded yet."]
-        embed = discord.Embed(
-            title=f"Staff & Mod VC Hours - last {days}d",
-            description="\n".join(lines),
-            color=EMBED_COLOR,
+        desc = (
+            "Earn points by staying active in the public voice channels.\n"
+            f"`{PTS_PER_HOUR} pts / hour in VC`"
         )
-        await ctx.send(embed=embed)
+        if not rows:
+            desc += "\n\nNo staff/mod VC time recorded yet."
+
+        embed = discord.Embed(
+            title="STAFF LEADERBOARD",
+            description=desc,
+            color=EMBED_COLOR,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_thumbnail(url=self.bot.user.display_avatar.url)
+
+        # podium
+        for label, (m, total, _) in zip(("1st place", "2nd place", "3rd place"), rows[:3]):
+            embed.add_field(
+                name=label,
+                value=f"{m.mention}\n**{pts(total):,}** pts\n`{fmt(total)}` in voice",
+                inline=True,
+            )
+
+        # rankings 4-15
+        if len(rows) > 3:
+            top = rows[0][1]
+            lines = []
+            for i, (m, total, _) in enumerate(rows[3:15], start=4):
+                filled = max(1, round(total / top * BAR_LEN))
+                bar = "■" * filled + "□" * (BAR_LEN - filled)
+                lines.append(f"`#{i:>2}` {m.mention} `{bar}` **{pts(total):,}** pts")
+            embed.add_field(name="Rankings", value="\n".join(lines)[:1024], inline=False)
+
+        # top this week
+        weekly = sorted((r for r in rows if r[2] > 0), key=lambda r: r[2], reverse=True)[:3]
+        if weekly:
+            lines = [f"`#{i}` {m.mention} **{pts(w):,}** pts" for i, (m, _, w) in enumerate(weekly, 1)]
+            embed.add_field(name="Top this week", value="\n".join(lines), inline=False)
+
+        # team totals
+        total_all = sum(r[1] for r in rows)
+        live = sum(1 for _ in self._live_members(guild))
+        embed.add_field(
+            name="Team totals",
+            value=(
+                f"`{len(rows)}` staff/mods · `{pts(total_all):,}` pts · `{fmt(total_all)}` in voice\n"
+                f"`{live}` in public VC right now"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text=f"Live · updates every {REFRESH_SECONDS}s")
+        return embed
+
+    async def _update_panel(self) -> None:
+        ch = self._find_channel()
+        if ch is None:
+            if not self._warned:
+                print("[vc_staff] leaderboard channel not found - set LEADERBOARD_CHANNEL_ID "
+                      f"or name a text channel '{CHANNEL_NAME_HINT}'.")
+                self._warned = True
+            return
+
+        embed = self._build_embed(ch.guild)
+        no_ping = discord.AllowedMentions.none()
+
+        # find the existing message (cached, else by saved id)
+        if self._msg is None and self.panel.get("channel_id") == ch.id and self.panel.get("message_id"):
+            try:
+                self._msg = await ch.fetch_message(self.panel["message_id"])
+            except discord.NotFound:
+                self._msg = None
+
+        if self._msg is not None:
+            try:
+                await self._msg.edit(embed=embed, allowed_mentions=no_ping)
+                return
+            except discord.NotFound:
+                self._msg = None  # deleted - post a fresh one below
+
+        self._msg = await ch.send(embed=embed, allowed_mentions=no_ping)
+        self.panel = {"channel_id": ch.id, "message_id": self._msg.id}
+        self._save(PANEL_FILE, self.panel)
 
 
 async def setup(bot: commands.Bot):
