@@ -9,12 +9,13 @@ What it does:
   - Public VCs: nobody is ever moved. Time spent MUTED or DEAFENED in a public VC is
     simply not counted (no move, no DM). It starts counting again the moment they
     unmute/undeafen.
-  - Temp channels: between 7:00 and 19:00 (BOT_TIMEZONE) a staff/mod who sits in a temp
-    VC for 10 minutes is moved to a public VC; if muted/deafened there they are moved
-    to the AFK channel instead. Outside those hours they can rest there freely.
-  - Anti-farming: if a staff/mod is alone in a public VC too long (no regular members,
-    only staff/bots), the bot takes that idle time back and stops counting until a
-    regular member joins. It does NOT move anyone.
+  - Work hours are 8:00 - 17:00 Tunisian time (Africa/Tunis). Outside them (5 PM - 8 AM)
+    the bot does not touch staff/mods: no moves, no DMs, no alone-in-VC rule.
+  - Temp channels: during work hours a staff/mod who sits in a temp VC for 10 minutes
+    is moved to a public VC; if muted/deafened there they are moved to the AFK channel.
+  - Anti-farming (work hours only): if a staff/mod is alone in a public VC too long (no
+    regular members, only staff/bots), the bot takes that idle time back and stops
+    counting until a regular member joins. It does NOT move anyone.
 
 Use:
   - Run /leaderboard in the channel where you want the board (needs Manage Server).
@@ -27,7 +28,8 @@ Setup:
     the bot finds the text channel whose name contains "staff-leaderboard".
   - On Railway, attach a Volume and set VC_HOURS_FILE=/data/vc_staff_hours.json
     so hours (and the leaderboard message id) survive redeploys.
-  - Set BOT_TIMEZONE in Railway (e.g. Africa/Tunis) or the 7:00-19:00 window is in UTC.
+  - Work hours / timezone can be changed with Railway variables TEMP_RULES_START_HOUR,
+    TEMP_RULES_END_HOUR and BOT_TIMEZONE (defaults: 8, 17, Africa/Tunis).
 """
 
 import asyncio
@@ -103,16 +105,18 @@ TEMP_CATEGORY_ID = int(os.getenv("TEMP_CATEGORY_ID", "0") or 0)  # optional: exa
 TEMP_CATEGORY_HINT = "temp channels"    # otherwise: any category whose name contains this
 TEMP_STAY_MINUTES = 10    # staff/mod in a temp VC this long -> moved to a public VC
 TEMP_MUTED_MINUTES = 5    # staff/mod muted or deafened in a temp VC this long -> moved to AFK
-TEMP_RULES_START_HOUR = int(os.getenv("TEMP_RULES_START_HOUR", "7"))    # 7 = 7 AM
-TEMP_RULES_END_HOUR = int(os.getenv("TEMP_RULES_END_HOUR", "19"))      # 19 = 7 PM
-# Outside those hours staff can rest in temp VCs (muted/deafened) and are never moved.
-# Set BOT_TIMEZONE in Railway to your timezone, e.g. Africa/Tunis, Europe/Paris, America/New_York
-BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "UTC")
+
+# ---- work hours: the bot only acts on staff/mods between these hours ----
+TEMP_RULES_START_HOUR = int(os.getenv("TEMP_RULES_START_HOUR", "8"))    # 8 = 8 AM
+TEMP_RULES_END_HOUR = int(os.getenv("TEMP_RULES_END_HOUR", "17"))       # 17 = 5 PM
+# Outside those hours (5 PM - 8 AM Tunisian time) the bot does not touch staff/mods at all:
+# no moves, no DMs, no alone-in-VC rule. They can rest in temp VCs muted/deafened.
+BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Africa/Tunis")   # Tunisian time
 try:
     LOCAL_TZ = ZoneInfo(BOT_TIMEZONE)
 except Exception:
-    print(f"[vc_staff] unknown BOT_TIMEZONE {BOT_TIMEZONE!r} - using UTC")
-    LOCAL_TZ = timezone.utc
+    print(f"[vc_staff] unknown BOT_TIMEZONE {BOT_TIMEZONE!r} - using UTC+1 (Tunisia)")
+    LOCAL_TZ = timezone(timedelta(hours=1))
 MOVE_TO_VC_ID = int(os.getenv("PUBLIC_MOVE_VC_ID", "0") or 0)  # optional: always move to this VC
 
 
@@ -127,7 +131,7 @@ def _is_join_channel(channel) -> bool:
 
 
 def temp_rules_active() -> bool:
-    """True during the work hours (default 7:00 - 19:00 in BOT_TIMEZONE)."""
+    """True during the work hours (default 8:00 - 17:00 Tunisian time)."""
     h = datetime.now(LOCAL_TZ).hour
     if TEMP_RULES_START_HOUR <= TEMP_RULES_END_HOUR:
         return TEMP_RULES_START_HOUR <= h < TEMP_RULES_END_HOUR
@@ -372,6 +376,12 @@ class VCStaff(commands.Cog):
                 break
 
     async def _anti_farm(self) -> None:
+        if not temp_rules_active():
+            # outside work hours (5 PM - 8 AM) the bot does not touch staff/mods
+            self.alone_since.clear()
+            self.alone_credit.clear()
+            self.farming.clear()
+            return
         now = time.time()
         for uid in list(self.active):
             if uid in EXEMPT_USER_IDS:
