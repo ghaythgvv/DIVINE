@@ -21,6 +21,27 @@ SILVER = (222, 208, 255)
 ROSE = (255, 150, 205)
 LILAC = (190, 120, 255)
 
+USE_BUTTERFLY = True   # False = go back to the normal circle avatars
+EMOJI_ID = "1553826933890879518"
+EMOJI_URL = f"https://cdn.discordapp.com/emojis/{EMOJI_ID}.png?size=256&quality=lossless"
+
+
+def _butterfly(size: int):
+    """Loads butterfly.png next to this file (downloaded once from Discord, then cached)."""
+    path = os.path.join(HERE, "butterfly.png")
+    if not os.path.exists(path):
+        try:
+            import urllib.request
+            req = urllib.request.Request(EMOJI_URL, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as r, open(path, "wb") as f:
+                f.write(r.read())
+        except Exception:
+            return None
+    try:
+        return Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS)
+    except Exception:
+        return None
+
 
 def _font(size: int):
     for path in (
@@ -59,6 +80,15 @@ def _glow(base, draw_fn, blur):
 
 
 def _circle_avatar(data, d):
+    if USE_BUTTERFLY:
+        bf = _butterfly(int(d * 0.78))
+        if bf is not None:
+            im = Image.new("RGBA", (d, d), (38, 14, 74, 255))
+            im.alpha_composite(bf, ((d - bf.width) // 2, (d - bf.height) // 2))
+            mask = Image.new("L", (d * 4, d * 4), 0)
+            ImageDraw.Draw(mask).ellipse([0, 0, d * 4 - 1, d * 4 - 1], fill=255)
+            im.putalpha(mask.resize((d, d), Image.LANCZOS))
+            return im
     if data:
         try:
             im = Image.open(io.BytesIO(data)).convert("RGBA")
