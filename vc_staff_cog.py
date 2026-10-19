@@ -6,9 +6,9 @@ What it does:
   - Keeps a single embed in the staff-leaderboard channel and edits it every
     30 seconds (podium, rankings, top this week, team totals).
   - Uses the bot's own profile picture as the embed thumbnail.
-  - Temp channels: a staff/mod who sits in a temp VC (the "Temp Channels" category)
-    for 10 minutes is moved to a public VC; if they are muted/deafened there they
-    are moved to the AFK channel instead.
+  - Temp channels: between 7:00 and 19:00 (BOT_TIMEZONE) a staff/mod who sits in a temp
+    VC for 10 minutes is moved to a public VC; if muted/deafened there they are moved
+    to the AFK channel instead. Outside those hours they can rest there freely.
   - Anti-farming: if a staff/mod is deafened too long, or alone in a VC too long,
     the bot takes that idle time back and stops counting until they are active
     again. It does NOT move anyone and does NOT send any DM.
@@ -33,6 +33,7 @@ import os
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -98,6 +99,16 @@ TEMP_CATEGORY_ID = int(os.getenv("TEMP_CATEGORY_ID", "0") or 0)  # optional: exa
 TEMP_CATEGORY_HINT = "temp channels"    # otherwise: any category whose name contains this
 TEMP_STAY_MINUTES = 10    # staff/mod in a temp VC this long -> moved to a public VC
 TEMP_MUTED_MINUTES = 5    # staff/mod muted or deafened in a temp VC this long -> moved to AFK
+TEMP_RULES_START_HOUR = int(os.getenv("TEMP_RULES_START_HOUR", "7"))    # 7 = 7 AM
+TEMP_RULES_END_HOUR = int(os.getenv("TEMP_RULES_END_HOUR", "19"))      # 19 = 7 PM
+# Outside those hours staff can rest in temp VCs (muted/deafened) and are never moved.
+# Set BOT_TIMEZONE in Railway to your timezone, e.g. Africa/Tunis, Europe/Paris, America/New_York
+BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "UTC")
+try:
+    LOCAL_TZ = ZoneInfo(BOT_TIMEZONE)
+except Exception:
+    print(f"[vc_staff] unknown BOT_TIMEZONE {BOT_TIMEZONE!r} - using UTC")
+    LOCAL_TZ = timezone.utc
 MOVE_TO_VC_ID = int(os.getenv("PUBLIC_MOVE_VC_ID", "0") or 0)  # optional: always move to this VC
 
 
@@ -109,6 +120,14 @@ def _norm(text: str) -> str:
 def _is_join_channel(channel) -> bool:
     n = _norm(channel.name)
     return "join" in n and "create" in n
+
+
+def temp_rules_active() -> bool:
+    """True during the work hours (default 7:00 - 19:00 in BOT_TIMEZONE)."""
+    h = datetime.now(LOCAL_TZ).hour
+    if TEMP_RULES_START_HOUR <= TEMP_RULES_END_HOUR:
+        return TEMP_RULES_START_HOUR <= h < TEMP_RULES_END_HOUR
+    return h >= TEMP_RULES_START_HOUR or h < TEMP_RULES_END_HOUR   # window that crosses midnight
 
 
 def fmt(seconds: float) -> str:
@@ -433,6 +452,11 @@ class VCStaff(commands.Cog):
         return True
 
     async def _temp_check(self) -> None:
+        if not temp_rules_active():
+            # resting hours: staff can sit muted/deafened in temp VCs, timers start fresh at the next shift
+            self.temp_since.clear()
+            self.temp_idle_since.clear()
+            return
         now = time.time()
         seen: set[int] = set()
         for guild in self.bot.guilds:
@@ -737,6 +761,8 @@ class VCStaff(commands.Cog):
             f"AFK channel: {afk.mention if afk else '**NOT FOUND**'}",
             f"Public VC target: {dest.mention if dest else '**NONE FOUND**'}",
             f"Rules: public VC after {TEMP_STAY_MINUTES} min, AFK after {TEMP_MUTED_MINUTES} min muted/deafened",
+            f"Active hours: {TEMP_RULES_START_HOUR}:00-{TEMP_RULES_END_HOUR}:00 ({BOT_TIMEZONE}) - "
+            f"now {datetime.now(LOCAL_TZ).strftime('%H:%M')} -> rules **{'ON' if temp_rules_active() else 'OFF (resting hours)'}**",
         ]
         if not temp:
             cats = ", ".join(f"`{c.name}`" for c in guild.categories)
