@@ -6,12 +6,15 @@ What it does:
   - Keeps a single embed in the staff-leaderboard channel and edits it every
     30 seconds (podium, rankings, top this week, team totals).
   - Uses the bot's own profile picture as the embed thumbnail.
+  - Public VCs: nobody is ever moved. Time spent MUTED or DEAFENED in a public VC is
+    simply not counted (no move, no DM). It starts counting again the moment they
+    unmute/undeafen.
   - Temp channels: between 7:00 and 19:00 (BOT_TIMEZONE) a staff/mod who sits in a temp
     VC for 10 minutes is moved to a public VC; if muted/deafened there they are moved
     to the AFK channel instead. Outside those hours they can rest there freely.
-  - Anti-farming: if a staff/mod is deafened too long, or alone in a VC too long,
-    the bot takes that idle time back and stops counting until they are active
-    again. It does NOT move anyone and does NOT send any DM.
+  - Anti-farming: if a staff/mod is alone in a public VC too long (no regular members,
+    only staff/bots), the bot takes that idle time back and stops counting until a
+    regular member joins. It does NOT move anyone.
 
 Use:
   - Run /leaderboard in the channel where you want the board (needs Manage Server).
@@ -24,6 +27,7 @@ Setup:
     the bot finds the text channel whose name contains "staff-leaderboard".
   - On Railway, attach a Volume and set VC_HOURS_FILE=/data/vc_staff_hours.json
     so hours (and the leaderboard message id) survive redeploys.
+  - Set BOT_TIMEZONE in Railway (e.g. Africa/Tunis) or the 7:00-19:00 window is in UTC.
 """
 
 import asyncio
@@ -80,10 +84,10 @@ EMOJI_ICON = "<:Elt_emoji_89:1552239138697121802>"
 # Optional big banner image at the bottom of the board (direct image/gif link).
 BANNER_URL = os.getenv("LEADERBOARD_BANNER_URL", "")
 
-# ---- anti-farming (no moving, no DMs - it only stops counting idle time) ----
+# ---- idle time (no moving in public VCs - it only stops counting) ----
 AFK_CHANNEL_ID = 1513904300013785241   # still never counted as a public VC
-ANTI_FARM = os.getenv("ANTI_FARM", "1") != "0"   # set ANTI_FARM=0 in Railway to switch off
-DEAF_MINUTES = 5     # staff/mod deafened this long in a public VC = not counted
+# Muted/deafened in a public VC is never counted (always on, nothing to configure).
+ANTI_FARM = os.getenv("ANTI_FARM", "1") != "0"   # alone-in-VC rule; set ANTI_FARM=0 in Railway to switch off
 ALONE_MINUTES = 20   # staff/mod with no regular members (only staff/bots) this long = not counted
 EXEMPT_USER_IDS: set[int] = {
     1552366484016205824,   # never moved / never checked
@@ -154,9 +158,9 @@ class VCStaff(commands.Cog):
         self.active: dict[int, tuple[int, float]] = {}
         self._msg: discord.Message | None = None
         self._warned = False
-        self.deaf_since: dict[int, float] = {}
         self.alone_since: dict[int, float] = {}
-        self.farming: set[int] = set()   # members whose time is currently NOT being counted
+        self.alone_credit: dict[int, float] = {}   # seconds actually counted while alone (so we only take back what was given)
+        self.farming: set[int] = set()   # members whose time is currently NOT being counted (alone too long)
         self.temp_since: dict[int, float] = {}        # staff in a temp VC since
         self.temp_idle_since: dict[int, float] = {}   # ...and muted/deafened since
         self._warned_move = False
@@ -194,10 +198,27 @@ class VCStaff(commands.Cog):
         k = today_key()
         days[k] = round(days.get(k, 0) + seconds, 1)
 
+    def _credit(self, uid: int, seconds: float) -> None:
+        """Count voice time, and remember how much was counted while the member is 'alone'."""
+        if seconds <= 0:
+            return
+        self._add(uid, seconds)
+        if uid in self.alone_since:
+            self.alone_credit[uid] = self.alone_credit.get(uid, 0.0) + seconds
+
     # ---------- helpers ----------
     @staticmethod
     def is_staff(member: discord.Member) -> bool:
         return (not member.bot) and any(r.id in STAFF_ROLE_IDS for r in member.roles)
+
+    @staticmethod
+    def is_idle(vs) -> bool:
+        """Muted or deafened (by themselves or by the server)."""
+        return bool(vs and (vs.self_mute or vs.self_deaf or vs.mute or vs.deaf))
+
+    def _not_counted(self, uid: int, vs) -> bool:
+        """True while this member's time must NOT be counted: muted/deafened in a public VC."""
+        return uid not in EXEMPT_USER_IDS and self.is_idle(vs)
 
     @staticmethod
     def is_public_vc(channel) -> bool:
@@ -256,19 +277,23 @@ class VCStaff(commands.Cog):
             guild_id, last = self.active[uid]
             guild = self.bot.get_guild(guild_id)
             member = guild.get_member(uid) if guild else None
+            vs = member.voice if member is not None else None
             still_in = (
                 member is not None
-                and member.voice is not None
+                and vs is not None
                 and self.is_staff(member)
-                and self.is_public_vc(member.voice.channel)
+                and self.is_public_vc(vs.channel)
             )
-            if uid not in self.farming:   # idle/farming time is not credited
-                self._add(uid, now - last)
+            # muted/deafened or "alone too long" time is not credited
+            if uid not in self.farming and not self._not_counted(uid, vs):
+                self._credit(uid, now - last)
             if still_in:
                 self.active[uid] = (guild_id, now)
             else:
                 del self.active[uid]
                 self.farming.discard(uid)
+                self.alone_since.pop(uid, None)
+                self.alone_credit.pop(uid, None)
 
     @tasks.loop(seconds=REFRESH_SECONDS)
     async def ticker(self):
@@ -301,28 +326,37 @@ class VCStaff(commands.Cog):
     async def on_voice_state_update(self, member, before, after):
         if member.bot or not self.is_staff(member):
             return
-        if not self.is_temp_vc(after.channel):
-            self.temp_since.pop(member.id, None)
-            self.temp_idle_since.pop(member.id, None)
-        if before.channel != after.channel:
-            self.deaf_since.pop(member.id, None)
-            self.alone_since.pop(member.id, None)
-            self.farming.discard(member.id)
-        elif before.self_deaf and not after.self_deaf:
-            self.deaf_since.pop(member.id, None)
-
+        t = time.time()
         was = self.is_public_vc(before.channel)
         now_in = self.is_public_vc(after.channel)
 
-        if now_in and not was:
-            self.active[member.id] = (member.guild.id, time.time())
-        elif was and not now_in:
-            session = self.active.pop(member.id, None)
-            if session and member.id not in self.farming:
-                self._add(member.id, time.time() - session[1])
+        # 1) close the time slice that just ended, using the state they were in BEFORE this change
+        #    (so the exact second they mute/deafen/unmute/leave is respected)
+        session = self.active.get(member.id)
+        if was and session:
+            if member.id not in self.farming and not self._not_counted(member.id, before):
+                self._credit(member.id, t - session[1])
+            self.active[member.id] = (session[0], t)
+
+        # 2) temp-channel timers
+        if not self.is_temp_vc(after.channel):
+            self.temp_since.pop(member.id, None)
+            self.temp_idle_since.pop(member.id, None)
+
+        # 3) changed channel -> reset the alone timer
+        if before.channel != after.channel:
+            self.alone_since.pop(member.id, None)
+            self.alone_credit.pop(member.id, None)
             self.farming.discard(member.id)
 
-    # ---------- anti-farming (no move, no DM) ----------
+        # 4) start / stop the session
+        if now_in and not was:
+            self.active[member.id] = (member.guild.id, t)
+        elif was and not now_in:
+            self.active.pop(member.id, None)
+            self.farming.discard(member.id)
+
+    # ---------- alone-in-VC rule (no move) ----------
     def _deduct(self, uid: int, seconds: float) -> None:
         """Take idle time back off the member's recent days."""
         days = self.data.get(str(uid), {})
@@ -342,46 +376,43 @@ class VCStaff(commands.Cog):
         for uid in list(self.active):
             if uid in EXEMPT_USER_IDS:
                 continue
-            guild = self.bot.get_guild(self.active[uid][0])
+            session = self.active.get(uid)
+            if session is None:
+                continue
+            guild = self.bot.get_guild(session[0])
             member = guild.get_member(uid) if guild else None
             if member is None or member.voice is None or not self.is_public_vc(member.voice.channel):
-                self.deaf_since.pop(uid, None)
                 self.alone_since.pop(uid, None)
+                self.alone_credit.pop(uid, None)
                 self.farming.discard(uid)
                 continue
 
-            vs = member.voice
-            # deafened = not listening to anyone
-            if vs.self_deaf:
-                self.deaf_since.setdefault(uid, now)
-            else:
-                self.deaf_since.pop(uid, None)
             # alone = nobody but staff/bots in the channel, so no members being helped
-            regulars = [m for m in vs.channel.members if not m.bot and not self.is_staff(m)]
+            regulars = [m for m in member.voice.channel.members if not m.bot and not self.is_staff(m)]
             if regulars:
                 self.alone_since.pop(uid, None)
-            else:
-                self.alone_since.setdefault(uid, now)
+                self.alone_credit.pop(uid, None)
+            elif uid not in self.alone_since:
+                self.alone_since[uid] = now
+                self.alone_credit[uid] = 0.0
 
-            reason, since = None, None
-            if uid in self.deaf_since and now - self.deaf_since[uid] >= DEAF_MINUTES * 60:
-                reason, since = f"deafened for {DEAF_MINUTES}+ minutes", self.deaf_since[uid]
-            elif uid in self.alone_since and now - self.alone_since[uid] >= ALONE_MINUTES * 60:
-                reason, since = f"alone in the VC for {ALONE_MINUTES}+ minutes", self.alone_since[uid]
-
-            if reason:
+            if uid in self.alone_since and now - self.alone_since[uid] >= ALONE_MINUTES * 60:
                 if uid not in self.farming:
-                    await self._start_not_counting(member, reason, since)
+                    await self._start_not_counting(member, f"alone in the VC for {ALONE_MINUTES}+ minutes")
             else:
-                # no longer deafened / alone -> counting resumes
+                # no longer alone -> counting resumes
                 self.farming.discard(uid)
 
-    async def _start_not_counting(self, member: discord.Member, reason: str, since: float) -> None:
+    async def _start_not_counting(self, member: discord.Member, reason: str) -> None:
         """Take back the idle time once, then stop counting until the member is active again."""
         self._flush()  # credit up to this second so the deduction below is exact
-        self._deduct(member.id, time.time() - since)
+        # only take back what was really counted while they were alone (muted time was never counted)
+        taken = self.alone_credit.get(member.id, 0.0)
+        self._deduct(member.id, taken)
         self.farming.add(member.id)
         self._save(DATA_FILE, self.data)
+        if taken <= 0:
+            return   # nothing was counted, so there is nothing to announce
         await self._dm(
             member,
             f"Hey 💜 you were {reason} in a public VC, so I took those points off and I'm not counting "
@@ -468,8 +499,7 @@ class VCStaff(commands.Cog):
                         continue
                     seen.add(m.id)
                     self.temp_since.setdefault(m.id, now)
-                    vs = m.voice
-                    if vs and (vs.self_mute or vs.self_deaf or vs.mute or vs.deaf):
+                    if self.is_idle(m.voice):
                         self.temp_idle_since.setdefault(m.id, now)
                     else:
                         self.temp_idle_since.pop(m.id, None)
