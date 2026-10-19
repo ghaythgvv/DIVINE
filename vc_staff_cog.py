@@ -1,11 +1,15 @@
 """
-vc_staff_cog.py - ONE live staff leaderboard (no commands at all).
+vc_staff_cog.py - ONE live staff leaderboard, ONE slash command (/leaderboard).
 
 What it does:
   - Tracks how long STAFF + MODERATORS spend in the public voice channels.
   - Keeps a single embed in the staff-leaderboard channel and edits it every
     30 seconds (podium, rankings, top this week, team totals).
   - Uses the bot's own profile picture as the embed thumbnail.
+
+Use:
+  - Run /leaderboard in the channel where you want the board (needs Manage Server).
+    It posts the live board there and moves it if it was somewhere else.
 
 Setup:
   - Enable the Server Members intent (code + Developer Portal).
@@ -22,6 +26,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 # Staff + Moderator roles - only these members are tracked.
@@ -192,6 +197,11 @@ class VCStaff(commands.Cog):
 
     # ---------- the live leaderboard ----------
     def _find_channel(self):
+        override = self.panel.get("channel_override")
+        if override:
+            ch = self.bot.get_channel(override)
+            if ch:
+                return ch
         if LEADERBOARD_CHANNEL_ID:
             ch = self.bot.get_channel(LEADERBOARD_CHANNEL_ID)
             if ch:
@@ -297,8 +307,49 @@ class VCStaff(commands.Cog):
                 self._msg = None  # deleted - post a fresh one below
 
         self._msg = await ch.send(embed=embed, allowed_mentions=no_ping)
-        self.panel = {"channel_id": ch.id, "message_id": self._msg.id}
+        self.panel.update({"channel_id": ch.id, "message_id": self._msg.id})
         self._save(PANEL_FILE, self.panel)
+
+    # ---------- the one command ----------
+    @app_commands.command(name="leaderboard", description="Post the live staff leaderboard in this channel")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def leaderboard(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("You need the Manage Server permission to use this.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        # remove the old board (cached message, else the saved ids)
+        if self._msg is not None:
+            try:
+                await self._msg.delete()
+            except discord.HTTPException:
+                pass
+        elif self.panel.get("channel_id") and self.panel.get("message_id"):
+            try:
+                old = self.bot.get_partial_messageable(self.panel["channel_id"]).get_partial_message(self.panel["message_id"])
+                await old.delete()
+            except discord.HTTPException:
+                pass
+        self._msg = None
+
+        ch = interaction.channel
+        self._flush()
+        try:
+            self._msg = await ch.send(
+                embed=self._build_embed(ch.guild),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I can't post here - give me View Channel, Send Messages and Embed Links in this channel.",
+                ephemeral=True,
+            )
+            return
+        self.panel = {"channel_override": ch.id, "channel_id": ch.id, "message_id": self._msg.id}
+        self._save(PANEL_FILE, self.panel)
+        await interaction.followup.send("Live leaderboard posted here. It updates by itself.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
